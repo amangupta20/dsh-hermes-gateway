@@ -11,7 +11,7 @@ kill it — only the headless CLI surface (`--json` event lines, `--session-id`)
 
 ## Layout
 
-- `server.js` — the whole gateway (~350 lines, `express` only)
+- `server.js` — the whole gateway (~390 lines, `express` only)
 - `package.json` — one dependency: `express`
 - `dev-shim.sh` — DEV-ONLY fake `dsh` for offline contract tests. Never use in prod.
 
@@ -99,6 +99,20 @@ systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
   secret-redacted), `message.delta`, `reasoning.delta`, terminal `run.completed`
   (usage + runtime). `: keepalive` comment every 10s. Stored per run, so reconnects
   replay from the start; settled runs replay then close.
+- Turn outcome is honored, not assumed: dsh always ends a `--json` run with exactly
+  one of `final` (then exit 0 = turn completed, exit 1 = turn error) or `error`
+  (infrastructure failure, exit 1). The gateway captures the `turn_end` reason and
+  the last 2KB of stderr (where dsh prints turn diagnostics like
+  `dsh: <code>: <message>`), so a turn error settles the run `failed` with the real
+  diagnostic instead of `completed` with an empty transcript. A clean exit with no
+  terminal event still settles (completed with whatever output accumulated), and a
+  trailing JSON line without newline is flushed on close — a missing terminal event
+  can never hang a run in `running`. Unknown dsh event types are logged once each
+  (gateway console + activity) so protocol drift is visible instead of silent.
+- `active.json` tracks submitted-but-unsettled runs: after a gateway restart, any
+  ids never settled are marked `failed` ("gateway restarted while this run was
+  active") so polling them terminates instead of 404ing forever. (`/admin/api`
+  run entries also carry `live`: whether the dsh proc is still alive.)
 - `POST /runs/:id/stop` kills the whole `dsh` process group (SIGTERM → SIGKILL) and
   returns `{"status":"stopping"}`; the run settles to `cancelled`.
 - SIGTERM/SIGINT: new submissions get `503` + `Retry-After: 5`, running procs are
@@ -138,7 +152,7 @@ web UI**. The gateway ships its own live view instead:
 
 - `GET /admin/api` (same `Bearer` auth) → JSON
   `{uptime_s, workspace, profile, model, runs[50], activity[100]}`. Run entries
-  carry a 200-char `output_tail`; activity is an in-memory ring (last 200:
+  carry a 200-char `output_tail` and a `live` flag (dsh proc still alive); activity is an in-memory ring (last 200:
   `{ts, kind, detail}`, kinds `http|run_started|run_settled|tool|stop|error` —
   headers/auth are never logged, session keys truncated to 120 chars).
   The `/admin/api` poll itself is excluded from the `http` activity so the

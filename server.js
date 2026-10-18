@@ -45,6 +45,11 @@ for (const [k, v] of Object.entries(idem)) if (Date.now() - v.ts > IDEM_TTL) del
 const persistIdem = () => save('idempotency.json', idem);
 const persistSess = () => save('sessions.json', sessMap);
 const persistRuns = () => save('runs.json', settled);
+let activeRuns = new Set(load('active.json', [])); // runs submitted but not yet settled (crash/restart recovery)
+for (const id of activeRuns) if (!settled[id]) settled[id] = { run_id: id, status: 'failed', session_id: 'unknown', output: 'gateway restarted while this run was active; retry the task' };
+if (activeRuns.size) { persistRuns(); logAct('error', `recovered ${activeRuns.size} run(s) active at shutdown as failed`); }
+activeRuns = new Set();
+const persistActive = () => save('active.json', [...activeRuns]);
 const persistConfirmed = () => { // cap 500 oldest; dsh's store is source of truth, this is a pass-list hint
   const ks = Object.keys(confirmed);
   if (ks.length > 500) for (const k of ks.slice(0, ks.length - 500)) delete confirmed[k];
@@ -73,6 +78,7 @@ function logAct(kind, detail) {
     if (activity.length > 200) activity.splice(0, activity.length - 200);
   } catch {}
 }
+const unhandledLogged = new Set(); // dsh event types with no handler, logged once each (protocol-drift visibility)
 
 const app = express();
 app.disable('x-powered-by');
@@ -162,8 +168,10 @@ async function submit(req, res) {
   let resume = Boolean(dshSession);
   if (dshSession && runningSessions.has(dshSession)) { dshSession = undefined; resume = false; } // concurrent runs never share a live session
   const run = { run_id: newId('run'), status: 'running', session_id: dshSession || `pending-${crypto.randomBytes(4).toString('hex')}`,
-    output: '', usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }, events: [], subs: new Set(), proc: null, skey, sid: session_id };
+    output: '', usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }, events: [], subs: new Set(), proc: null, skey, sid: session_id,
+    finalText: '', finalArrived: false, turnReason: null, stderrTail: '' };
   runs.set(run.run_id, run);
+  activeRuns.add(run.run_id); persistActive();
   logAct('run_started', `${run.run_id} session=${truncKey(run.skey || session_id || dshSession || '', 120)} resume=${resume}`);
   idem[key] = { run_id: run.run_id, bodyHash, ts: Date.now() }; persistIdem();
   const note = process.env.DSH_PREAMBLE === undefined
@@ -188,13 +196,23 @@ function startRun(run, task, dshSession) {
   let buf = '';
   proc.stdout.on('data', (c) => { buf += c; const lines = buf.split('\n'); buf = lines.pop();
     for (const l of lines) { if (!l.trim()) continue; try { onDsh(run, JSON.parse(l)); } catch {} } });
-  proc.stderr.on('data', () => {}); // reasoning progress; not part of contract
+  proc.stderr.on('data', (c) => { run.stderrTail = (run.stderrTail + c.toString()).slice(-2000); }); // keep tail: turn-error diagnostics print here
   proc.on('error', (e) => { logAct('error', `${run.run_id} dsh error: ${String(e.message || e).slice(0, 200)}`); settle(run, 'failed', `dsh error: ${e.message}`); });
   proc.on('close', (code, sig) => {
     if (run.status !== 'running') return;
-    if (run.stopping || sig || code === 130 || code === 143) settle(run, 'cancelled');
-    else if (code === 0) { if (!run.output) settle(run, 'completed', ''); }
-    else settle(run, 'failed', run.output || `dsh exited with code ${code}`);
+    if (buf.trim()) { try { onDsh(run, JSON.parse(buf)); } catch {} buf = ''; } // trailing line without newline
+    if (run.status !== 'running') return; // flush may have settled via error event
+    if (run.stopping || sig || code === 130 || code === 143) return settle(run, 'cancelled');
+    // dsh emits exactly one of {final, error} then exits (0 = turn completed, 1 = turn/infra error),
+    // but settle here regardless so a missing terminal event can never hang the run.
+    const turnFailed = run.turnReason && run.turnReason.kind !== 'completed';
+    if (code !== 0 || turnFailed) {
+      const why = redact(run.stderrTail).trim()
+        || (run.turnReason && run.turnReason.error ? `${run.turnReason.error.code || 'error'}: ${run.turnReason.error.message || ''}`.trim() : '')
+        || run.finalText || run.output || `dsh exited with code ${code}`;
+      return settle(run, 'failed', why);
+    }
+    settle(run, 'completed', run.finalText || run.output || '');
   });
 }
 function onDsh(run, e) {
@@ -209,8 +227,12 @@ function onDsh(run, e) {
     case 'tool_result': push(run, 'tool.completed', { run_id: run.run_id, tool: e.tool || '', preview: preview(e.result), status: e.status || 'completed', callId: e.callId }); logAct('tool', `${run.run_id} completed ${String(e.tool || '').slice(0, 80)}`); break;
     case 'text': run.output += e.text || ''; push(run, 'message.delta', { run_id: run.run_id, delta: e.text || '' }); break;
     case 'thinking': push(run, 'reasoning.delta', { run_id: run.run_id, delta: e.text || '' }); break;
-    case 'status': if (e.usage) { const u = e.usage; run.usage = { input_tokens: u.inputTokens || 0, output_tokens: u.outputTokens || 0, total_tokens: u.totalTokens ?? (u.inputTokens || 0) + (u.outputTokens || 0) }; } break;
-    case 'final': settle(run, 'completed', e.text || run.output); break;
+    case 'status': {
+      if (e.usage) { const u = e.usage; run.usage = { input_tokens: u.inputTokens || 0, output_tokens: u.outputTokens || 0, total_tokens: u.totalTokens ?? (u.inputTokens || 0) + (u.outputTokens || 0) }; }
+      if (e.phase === 'turn_end' && e.reason && typeof e.reason === 'object') run.turnReason = e.reason; // completed vs error decides settle
+      break;
+    }
+    case 'final': run.output = e.text || run.output; run.finalText = e.text || ''; run.finalArrived = true; break; // settled on close with exit code + turn reason
     case 'error': {
       const m = /session "([^"]+)" does not exist/.exec(e.message || '');
       if (m) { // stale mapping (e.g. session never created, or pruned out-of-band): drop it + unconfirm so the next retry starts fresh instead of looping on the phantom
@@ -223,12 +245,22 @@ function onDsh(run, e) {
       settle(run, 'failed', e.message || 'dsh error');
       break;
     }
+    default: {
+      if (e && typeof e.type === 'string' && !unhandledLogged.has(e.type)) { // future dsh event: visible, not silent
+        unhandledLogged.add(e.type);
+        const msg = `unhandled dsh event type=${JSON.stringify(e.type).slice(0, 80)} (protocol may have drifted)`;
+        console.warn(`dsh-hermes-gateway: ${run.run_id} ${msg}`);
+        logAct('error', `${run.run_id} ${msg}`);
+      }
+      break;
+    }
   }
 }
 function settle(run, status, output) {
   if (run.status !== 'running') return;
   run.status = status; if (output !== undefined) run.output = output;
   runningSessions.delete(run.session_id);
+  activeRuns.delete(run.run_id); persistActive();
   settled[run.run_id] = { run_id: run.run_id, status, session_id: run.session_id, output: run.output }; persistRuns();
   logAct(status === 'failed' ? 'error' : 'run_settled', `${run.run_id} -> ${status}`);
   push(run, 'run.completed', { run_id: run.run_id, status, output: run.output, usage: { input_tokens: run.usage.input_tokens, output_tokens: run.usage.output_tokens, total_tokens: run.usage.total_tokens }, runtime: { provider: 'deepseek', model: DSH_MODEL, route_source: 'global' } });
@@ -275,9 +307,10 @@ app.get('/admin/api', authed, (req, res) => {
   const all = [...runs.values()].map((r) => ({
     run_id: r.run_id, status: r.status, session_id: r.session_id,
     output_tail: tail(redact(r.output || '')),
+    live: Boolean(r.proc && r.proc.exitCode === null && r.status === 'running'), // dsh proc still alive?
     usage: r.usage ? { input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens, total_tokens: r.usage.total_tokens } : undefined,
   })).concat(extra.map((s) => ({
-    run_id: s.run_id, status: s.status, session_id: s.session_id, output_tail: tail(redact(s.output || '')),
+    run_id: s.run_id, status: s.status, session_id: s.session_id, output_tail: tail(redact(s.output || '')), live: false,
   })));
   res.json({
     uptime_s: Math.floor((Date.now() - BOOT_TS) / 1000),
@@ -296,7 +329,7 @@ th{background:#f2f2f2}code{font-size:12px;word-break:break-all}.tail{white-space
 #meta{color:#444;margin-bottom:1em}#err{color:#a00}</style></head>
 <body><h1>dsh-hermes-gateway</h1>
 <div id="meta">connecting…</div><div id="err"></div>
-<h2>Runs (last 50)</h2><table><thead><tr><th>run_id</th><th>status</th><th>session</th><th>output tail (200ch)</th></tr></thead><tbody id="runs"></tbody></table>
+<h2>Runs (last 50)</h2><table><thead><tr><th>run_id</th><th>status</th><th>live</th><th>session</th><th>output tail (200ch)</th></tr></thead><tbody id="runs"></tbody></table>
 <h2>Activity (last 100)</h2><table><thead><tr><th>ts</th><th>kind</th><th>detail</th></tr></thead><tbody id="act"></tbody></table>
 <script>(function(){
 var key = sessionStorage.getItem('dsh_gw_key') || window.prompt('Bearer key (DSH_GATEWAY_KEY):') || '';
@@ -317,7 +350,7 @@ async function poll(){
     var rb = el('runs'); rb.textContent = '';
     j.runs.forEach(function(run){
       var tr = document.createElement('tr');
-      tr.appendChild(td(run.run_id)); tr.appendChild(td(run.status)); tr.appendChild(td(run.session_id));
+      tr.appendChild(td(run.run_id)); tr.appendChild(td(run.status)); tr.appendChild(td(run.live ? 'yes' : '')); tr.appendChild(td(run.session_id));
       var t = document.createElement('td'); t.className = 'tail'; t.textContent = run.output_tail || ''; tr.appendChild(t);
       rb.appendChild(tr);
     });
