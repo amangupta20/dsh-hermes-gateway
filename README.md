@@ -20,11 +20,23 @@ kill it — only the headless CLI surface (`--json` event lines, `--session-id`)
 ```bash
 cd .  # repo root (gateway files live at the top level)
 npm install
-DSH_GATEWAY_KEY='<long-random-secret>' \   # required, == Paperclip's apiKey
-DSH_WORKSPACE=/path/to/working/dir \        # cwd for all runs (resume requires one stable cwd)
-DSH_PROFILE=headless \                       # dsh profile to drive
-DSH_MODEL='muse-spark-1.3-contributor' \     # advertised in runtime.model
-PORT=8642 node server.js                     # listens on 0.0.0.0:8642 (Hermes default)
+cp .env.example .env   # then edit .env and set a real DSH_GATEWAY_KEY (openssl rand -hex 32)
+node server.js         # listens on 0.0.0.0:8642 (Hermes default)
+```
+
+Config precedence: **real environment > `.env` file > built-ins**. Values already
+set in the environment are never overwritten by `.env`. To use a different file,
+set `DSH_GATEWAY_ENV=/path/to/custom.env` (defaults to `./.env` next to
+`server.js`). `.env` is git-ignored; only `.env.example` is committed.
+
+Alternative (no `.env` file — inline env one-liner):
+
+```bash
+DSH_GATEWAY_KEY='<long-random-secret>' \
+DSH_WORKSPACE=/path/to/working/dir \
+DSH_PROFILE=headless \
+DSH_MODEL='muse-spark-1.3-contributor' \
+PORT=8642 node server.js
 ```
 
 Target machine needs the shipped `headless` profile working (no setup needed for the
@@ -53,6 +65,7 @@ systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
 | `DSH_PROFILE` | no | `headless` | `dsh` profile to drive. |
 | `DSH_MODEL` | no | `muse-spark-1.3-contributor` | Model string reported in `runtime.model`. |
 | `DSH_GATEWAY_DATA` | no | `./.dsh-hermes-gateway` | State dir: idempotency keys (24h TTL), session-key→dsh-session map, settled runs. |
+| `DSH_GATEWAY_ENV` | no | `./.env` (next to `server.js`) | Path to the `.env` file to load. Real env always wins over this file. |
 | `DSH_PREAMBLE` | no | (see below) | Context line prepended to every task so the harness agent knows it is serving a Paperclip Hermes run (includes run_id + session key). Set to empty to disable. |
 
 ## Contract notes

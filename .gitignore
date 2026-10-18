@@ -1,3 +1,6 @@
 node_modules/
 .dsh-hermes-gateway/
 tree.json
+.env
+.env.*
+!.env.example

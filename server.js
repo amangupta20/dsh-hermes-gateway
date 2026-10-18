@@ -8,6 +8,21 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// Minimal .env loader (no dependencies): real environment always wins.
+const __envFile = process.env.DSH_GATEWAY_ENV || path.join(__dirname, '.env');
+try {
+  const __src = fs.readFileSync(__envFile, 'utf8');
+  for (const __line of __src.split('\n')) {
+    const __t = __line.trim();
+    if (!__t || __t.startsWith('#')) continue;
+    const __m = __t.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!__m || process.env[__m[1]] !== undefined) continue;
+    let __v = __m[2].trim();
+    if (__v.length >= 2 && ((__v[0] === '"' && __v[__v.length - 1] === '"') || (__v[0] === "'" && __v[__v.length - 1] === "'"))) __v = __v.slice(1, -1);
+    process.env[__m[1]] = __v;
+  }
+} catch {}
+
 const PORT = Number(process.env.PORT || 8642);
 const KEY = process.env.DSH_GATEWAY_KEY;
 const WORKSPACE = process.env.DSH_WORKSPACE || process.cwd();
