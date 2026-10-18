@@ -133,10 +133,13 @@ web UI**. The gateway ships its own live view instead:
   headers/auth are never logged, session keys truncated to 120 chars).
   The `/admin/api` poll itself is excluded from the `http` activity so the
   2s refresh doesn't push real history out of the ring.
-- `GET /admin` (same `Bearer` auth) → self-contained HTML page that `fetch`-polls
+- `GET /admin` → self-contained HTML page (no auth — it contains no secrets;
+  requiring a bearer here would make the browser show a bare 401 instead of
+  the page, so the key prompt could never appear). The page `fetch`-polls
   `/admin/api` every 2s. The key comes from `prompt()` (stored in
   `sessionStorage`); a 401 clears it and re-prompts. (`EventSource` can't set
-  `Authorization` headers, hence polling instead of SSE here.)
+  `Authorization` headers, hence polling instead of SSE here.) All run data
+  stays behind bearer auth on `/admin/api`.
 
 ```bash
 open http://127.0.0.1:8642/admin   # enter DSH_GATEWAY_KEY at the prompt

@@ -243,7 +243,7 @@ for (const p of ['/v1/runs/:id/stop', '/api/v1/runs/:id/stop'])
     res.json({ status: 'stopping' });
   });
 
-// ---- live admin dashboard (same bearer auth; headless runs are invisible in dsh web UI) ----
+// ---- live admin dashboard (data behind bearer auth; headless runs are invisible in dsh web UI) ----
 app.get('/admin/api', authed, (req, res) => {
   const memIds = new Set(runs.keys());
   const extra = Object.values(settled).filter((s) => !memIds.has(s.run_id));
@@ -307,7 +307,11 @@ async function poll(){
 }
 window.setInterval(poll, 2000); poll();
 })();</script></body></html>`;
-app.get('/admin', authed, (req, res) => res.type('html').send(ADMIN_HTML));
+// NOTE: the HTML shell itself is unauthenticated on purpose — it contains no
+// secrets, and requiring bearer auth here would make the browser render a bare
+// 401 JSON on navigation so the in-page key prompt could never appear.
+// All data stays behind bearer auth on /admin/api.
+app.get('/admin', (req, res) => res.type('html').send(ADMIN_HTML));
 
 app.use((req, res) => res.status(404).json({ error: { code: 'not_found', message: 'unknown route' } }));
 // eslint-disable-next-line no-unused-vars
