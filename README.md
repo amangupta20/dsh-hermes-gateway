@@ -18,7 +18,7 @@ kill it — only the headless CLI surface (`--json` event lines, `--session-id`)
 ## Run
 
 ```bash
-cd dsh-hermes-gateway
+cd .  # repo root (gateway files live at the top level)
 npm install
 DSH_GATEWAY_KEY='<long-random-secret>' \   # required, == Paperclip's apiKey
 DSH_WORKSPACE=/path/to/working/dir \        # cwd for all runs (resume requires one stable cwd)
