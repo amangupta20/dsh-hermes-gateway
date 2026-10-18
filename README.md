@@ -120,6 +120,11 @@ systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
   secret-redacted), `message.delta`, `reasoning.delta`, terminal `run.completed`
   (usage + runtime). `: keepalive` comment every 10s. Stored per run, so reconnects
   replay from the start; settled runs replay then close.
+  Protocol caution (verified against the Paperclip adapter source): Paperclip treats
+  a `status` field in **any** SSE event's data as terminal state, reads transcript
+  only from `message.delta` `delta`/`text_delta` fields, and takes terminal output
+  only from `output|result|text|summary|message` — so `tool.*` events carry tool state
+  as `state` (never `status`), and only `run.completed` carries `status`/`output`.
 - Turn outcome is honored, not assumed: dsh always ends a `--json` run with exactly
   one of `final` (then exit 0 = turn completed, exit 1 = turn error) or `error`
   (infrastructure failure, exit 1). The gateway captures the `turn_end` reason and
@@ -178,6 +183,10 @@ web UI**. The gateway ships its own live view instead:
   headers/auth are never logged, session keys truncated to 120 chars).
   The `/admin/api` poll itself is excluded from the `http` activity so the
   2s refresh doesn't push real history out of the ring.
+- `GET /admin/api/runs/:id` (same bearer auth) → one run with the **full**
+  untruncated `output` (the list carries 200-char tails only), plus `live` and event
+  count — e.g. to read an answer Paperclip failed to display:
+  `curl -H "Authorization: Bearer <key>" .../admin/api/runs/<run_id>`.
 - `GET /admin` → self-contained HTML page (no auth — it contains no secrets;
   requiring a bearer here would make the browser show a bare 401 instead of
   the page, so the key prompt could never appear). The page `fetch`-polls

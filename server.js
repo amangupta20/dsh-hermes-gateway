@@ -227,7 +227,10 @@ function onDsh(run, e) {
       if (run.sid && !sessMap['sid:' + run.sid]) { sessMap['sid:' + run.sid] = run.session_id; persistSess(); }
       runningSessions.add(run.session_id); break;
     case 'tool_call': push(run, 'tool.started', { run_id: run.run_id, tool: e.tool, preview: preview(e.input), callId: e.callId }); logAct('tool', `${run.run_id} started ${String(e.tool || '').slice(0, 80)}`); break;
-    case 'tool_result': push(run, 'tool.completed', { run_id: run.run_id, tool: e.tool || '', preview: preview(e.result), status: e.status || 'completed', callId: e.callId }); logAct('tool', `${run.run_id} completed ${String(e.tool || '').slice(0, 80)}`); break;
+    // NOTE: this data must NEVER contain a `status` key: Paperclip treats a `status`
+    // field in ANY SSE event as terminal state, so `status:"completed"` here ended the
+    // run in Paperclip's view at the first tool result. Tool state travels as `state`.
+    case 'tool_result': push(run, 'tool.completed', { run_id: run.run_id, tool: e.tool || '', preview: preview(e.result), state: e.status || 'completed', callId: e.callId }); logAct('tool', `${run.run_id} completed ${String(e.tool || '').slice(0, 80)}`); break;
     case 'text': run.output += e.text || ''; push(run, 'message.delta', { run_id: run.run_id, delta: e.text || '' }); break;
     case 'thinking': push(run, 'reasoning.delta', { run_id: run.run_id, delta: e.text || '' }); break;
     case 'status': {
@@ -321,6 +324,12 @@ app.get('/admin/api', authed, (req, res) => {
     runs: all.slice(-50).reverse(),
     activity: activity.slice(-100).reverse(),
   });
+});
+// Full untruncated run output (the list above carries 200-char tails only) —
+// e.g. to read an answer Paperclip failed to display: curl with the bearer key.
+app.get('/admin/api/runs/:id', authed, (req, res) => {
+  const r = findRun(req, res); if (!r) return;
+  res.json({ ...view(r), live: Boolean(r.proc && r.proc.exitCode === null && r.status === 'running'), events: r.events ? r.events.length : 0 });
 });
 const ADMIN_HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
