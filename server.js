@@ -55,11 +55,27 @@ const trunc = (s, n = 500) => (s = String(s ?? ''), s.length > n ? s.slice(0, n 
 const redact = (s) => String(s ?? '').replace(/oc_sk_[A-Za-z0-9_-]+|sk-[A-Za-z0-9-_]{8,}|Bearer\s+[A-Za-z0-9\-._~+/=]+|api[_-]?key["'\s:=]+[^\s"',}]{4,}/gi, '[REDACTED]');
 const preview = (v) => trunc(redact(typeof v === 'string' ? v : JSON.stringify(v)));
 
+// ---- live admin dashboard (in-memory only; headless runs never appear in dsh web UI) ----
+const BOOT_TS = Date.now();
+const activity = []; // ring buffer: last 200 {ts, kind, detail}
+const truncKey = (s, n = 120) => String(s ?? '').slice(0, n); // session keys truncated, never full-logged beyond 120
+const tail = (s, n = 200) => { s = String(s ?? ''); return s.length > n ? '…' + s.slice(-(n - 1)) : s; }; // 200-char output tails
+function logAct(kind, detail) {
+  try {
+    activity.push({ ts: new Date().toISOString(), kind, detail: String(detail ?? '').slice(0, 500) });
+    if (activity.length > 200) activity.splice(0, activity.length - 200);
+  } catch {}
+}
+
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
-app.use((req, res, next) => { // access log: never log the bearer key
-  res.on('finish', () => console.log(`${req.method} ${req.path} -> ${res.statusCode}`));
+app.use((req, res, next) => { // access log: never log headers/auth, only method + path + status
+  res.on('finish', () => {
+    console.log(`${req.method} ${req.path} -> ${res.statusCode}`);
+    if (req.path === '/admin/api') return; // skip dashboard poll noise so the 200-entry ring keeps real history
+    logAct('http', `${req.method} ${req.path} -> ${res.statusCode}`);
+  });
   next();
 });
 const authed = (req, res, next) => {
@@ -134,6 +150,7 @@ async function submit(req, res) {
   const run = { run_id: newId('run'), status: 'running', session_id: dshSession || `pending-${crypto.randomBytes(4).toString('hex')}`,
     output: '', usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }, events: [], subs: new Set(), proc: null, skey, sid: session_id };
   runs.set(run.run_id, run);
+  logAct('run_started', `${run.run_id} session=${truncKey(run.skey || session_id || dshSession || '', 120)} resume=${resume}`);
   idem[key] = { run_id: run.run_id, bodyHash, ts: Date.now() }; persistIdem();
   if (session_id) persistSess();
   const note = process.env.DSH_PREAMBLE === undefined
@@ -152,14 +169,14 @@ function startRun(run, task, dshSession) {
   args.push(task);
   let proc;
   try { proc = spawn(DSH_BIN, args, { cwd: WORKSPACE, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: true }); } // own process group so stop kills dsh + its children
-  catch (e) { return settle(run, 'failed', `failed to spawn dsh: ${e.message}`); }
+  catch (e) { logAct('error', `${run.run_id} spawn failed: ${String(e.message || e).slice(0, 200)}`); return settle(run, 'failed', `failed to spawn dsh: ${e.message}`); }
   run.proc = proc;
   if (dshSession) { runningSessions.add(dshSession); run.session_id = dshSession; }
   let buf = '';
   proc.stdout.on('data', (c) => { buf += c; const lines = buf.split('\n'); buf = lines.pop();
     for (const l of lines) { if (!l.trim()) continue; try { onDsh(run, JSON.parse(l)); } catch {} } });
   proc.stderr.on('data', () => {}); // reasoning progress; not part of contract
-  proc.on('error', (e) => settle(run, 'failed', `dsh error: ${e.message}`));
+  proc.on('error', (e) => { logAct('error', `${run.run_id} dsh error: ${String(e.message || e).slice(0, 200)}`); settle(run, 'failed', `dsh error: ${e.message}`); });
   proc.on('close', (code, sig) => {
     if (run.status !== 'running') return;
     if (run.stopping || sig || code === 130 || code === 143) settle(run, 'cancelled');
@@ -174,8 +191,8 @@ function onDsh(run, e) {
       if (run.skey && !sessMap[run.skey]) { sessMap[run.skey] = run.session_id; persistSess(); }
       if (run.sid && !sessMap['sid:' + run.sid]) { sessMap['sid:' + run.sid] = run.session_id; persistSess(); }
       runningSessions.add(run.session_id); break;
-    case 'tool_call': push(run, 'tool.started', { run_id: run.run_id, tool: e.tool, preview: preview(e.input), callId: e.callId }); break;
-    case 'tool_result': push(run, 'tool.completed', { run_id: run.run_id, tool: e.tool || '', preview: preview(e.result), status: e.status || 'completed', callId: e.callId }); break;
+    case 'tool_call': push(run, 'tool.started', { run_id: run.run_id, tool: e.tool, preview: preview(e.input), callId: e.callId }); logAct('tool', `${run.run_id} started ${String(e.tool || '').slice(0, 80)}`); break;
+    case 'tool_result': push(run, 'tool.completed', { run_id: run.run_id, tool: e.tool || '', preview: preview(e.result), status: e.status || 'completed', callId: e.callId }); logAct('tool', `${run.run_id} completed ${String(e.tool || '').slice(0, 80)}`); break;
     case 'text': run.output += e.text || ''; push(run, 'message.delta', { run_id: run.run_id, delta: e.text || '' }); break;
     case 'thinking': push(run, 'reasoning.delta', { run_id: run.run_id, delta: e.text || '' }); break;
     case 'status': if (e.usage) { const u = e.usage; run.usage = { input_tokens: u.inputTokens || 0, output_tokens: u.outputTokens || 0, total_tokens: u.totalTokens ?? (u.inputTokens || 0) + (u.outputTokens || 0) }; } break;
@@ -188,6 +205,7 @@ function settle(run, status, output) {
   run.status = status; if (output !== undefined) run.output = output;
   runningSessions.delete(run.session_id);
   settled[run.run_id] = { run_id: run.run_id, status, session_id: run.session_id, output: run.output }; persistRuns();
+  logAct(status === 'failed' ? 'error' : 'run_settled', `${run.run_id} -> ${status}`);
   push(run, 'run.completed', { run_id: run.run_id, status, output: run.output, usage: { input_tokens: run.usage.input_tokens, output_tokens: run.usage.output_tokens, total_tokens: run.usage.total_tokens }, runtime: { provider: 'deepseek', model: DSH_MODEL, route_source: 'global' } });
 }
 
@@ -220,13 +238,81 @@ for (const p of ['/v1/runs/:id/stop', '/api/v1/runs/:id/stop'])
     if (!r) return res.status(404).json({ error: { code: 'not_found', message: 'unknown run_id' } });
     if (r.status !== 'running' || !r.proc) return res.json({ status: r.status });
     r.stopping = true;
+    logAct('stop', `${req.params.id} SIGTERM->SIGKILL`);
     killRun(r, 'SIGTERM'); setTimeout(() => { if (r.status === 'running') killRun(r, 'SIGKILL'); }, 5000);
     res.json({ status: 'stopping' });
   });
 
+// ---- live admin dashboard (same bearer auth; headless runs are invisible in dsh web UI) ----
+app.get('/admin/api', authed, (req, res) => {
+  const memIds = new Set(runs.keys());
+  const extra = Object.values(settled).filter((s) => !memIds.has(s.run_id));
+  const all = [...runs.values()].map((r) => ({
+    run_id: r.run_id, status: r.status, session_id: r.session_id,
+    output_tail: tail(redact(r.output || '')),
+    usage: r.usage ? { input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens, total_tokens: r.usage.total_tokens } : undefined,
+  })).concat(extra.map((s) => ({
+    run_id: s.run_id, status: s.status, session_id: s.session_id, output_tail: tail(redact(s.output || '')),
+  })));
+  res.json({
+    uptime_s: Math.floor((Date.now() - BOOT_TS) / 1000),
+    workspace: WORKSPACE, profile: DSH_PROFILE, model: DSH_MODEL,
+    runs: all.slice(-50).reverse(),
+    activity: activity.slice(-100).reverse(),
+  });
+});
+const ADMIN_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>dsh-hermes-gateway admin</title>
+<style>body{font-family:system-ui,sans-serif;max-width:1000px;margin:2em auto;padding:0 1em;color:#111}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}
+th{background:#f2f2f2}code{font-size:12px;word-break:break-all}.tail{white-space:pre-wrap;max-width:480px}
+#meta{color:#444;margin-bottom:1em}#err{color:#a00}</style></head>
+<body><h1>dsh-hermes-gateway</h1>
+<div id="meta">connecting…</div><div id="err"></div>
+<h2>Runs (last 50)</h2><table><thead><tr><th>run_id</th><th>status</th><th>session</th><th>output tail (200ch)</th></tr></thead><tbody id="runs"></tbody></table>
+<h2>Activity (last 100)</h2><table><thead><tr><th>ts</th><th>kind</th><th>detail</th></tr></thead><tbody id="act"></tbody></table>
+<script>(function(){
+var key = sessionStorage.getItem('dsh_gw_key') || window.prompt('Bearer key (DSH_GATEWAY_KEY):') || '';
+if (key) sessionStorage.setItem('dsh_gw_key', key);
+function el(id){ return document.getElementById(id); }
+function td(text){ var d = document.createElement('td'); d.textContent = text; return d; }
+async function poll(){
+  try {
+    var r = await window.fetch('/admin/api', { headers: { 'Authorization': 'Bearer ' + key } });
+    if (r.status === 401) {
+      sessionStorage.removeItem('dsh_gw_key');
+      key = window.prompt('Bearer key (401 — try again):') || '';
+      if (key) sessionStorage.setItem('dsh_gw_key', key);
+      return;
+    }
+    var j = await r.json();
+    el('meta').textContent = 'up ' + j.uptime_s + 's · workspace ' + j.workspace + ' · profile ' + j.profile + ' · model ' + j.model;
+    var rb = el('runs'); rb.textContent = '';
+    j.runs.forEach(function(run){
+      var tr = document.createElement('tr');
+      tr.appendChild(td(run.run_id)); tr.appendChild(td(run.status)); tr.appendChild(td(run.session_id));
+      var t = document.createElement('td'); t.className = 'tail'; t.textContent = run.output_tail || ''; tr.appendChild(t);
+      rb.appendChild(tr);
+    });
+    var ab = el('act'); ab.textContent = '';
+    j.activity.forEach(function(a){
+      var tr = document.createElement('tr');
+      tr.appendChild(td(a.ts)); tr.appendChild(td(a.kind)); tr.appendChild(td(a.detail));
+      ab.appendChild(tr);
+    });
+    el('err').textContent = '';
+  } catch (e) { el('err').textContent = 'fetch error: ' + e; }
+}
+window.setInterval(poll, 2000); poll();
+})();</script></body></html>`;
+app.get('/admin', authed, (req, res) => res.type('html').send(ADMIN_HTML));
+
 app.use((req, res) => res.status(404).json({ error: { code: 'not_found', message: 'unknown route' } }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
+  logAct('error', `${req.method} ${req.path} ${err?.type || err?.message || 'internal'}`.slice(0, 200));
   if (err?.type === 'entity.parse.failed' || err instanceof SyntaxError) return bad(res, 'invalid JSON body');
   res.status(500).json({ error: { code: 'internal', message: 'internal error' } });
 });

@@ -11,7 +11,7 @@ kill it — only the headless CLI surface (`--json` event lines, `--session-id`)
 
 ## Layout
 
-- `server.js` — the whole gateway (~220 lines, `express` only)
+- `server.js` — the whole gateway (~320 lines, `express` only)
 - `package.json` — one dependency: `express`
 - `dev-shim.sh` — DEV-ONLY fake `dsh` for offline contract tests. Never use in prod.
 
@@ -119,6 +119,28 @@ curl -N -H "$AUTH" $BASE/v1/runs/<run_id>/events
 # 6. stop: submit {"input":"... sleep 60 ..."}, then:
 curl -X POST -H "$AUTH" $BASE/v1/runs/<run_id>/stop   # -> {"status":"stopping"}
 curl -H "$AUTH" $BASE/v1/runs/<run_id>                # -> status cancelled
+```
+
+## Live dashboard
+
+Headless runs are one-shot `dsh` subprocesses, so they **never appear in the dsh
+web UI**. The gateway ships its own live view instead:
+
+- `GET /admin/api` (same `Bearer` auth) → JSON
+  `{uptime_s, workspace, profile, model, runs[50], activity[100]}`. Run entries
+  carry a 200-char `output_tail`; activity is an in-memory ring (last 200:
+  `{ts, kind, detail}`, kinds `http|run_started|run_settled|tool|stop|error` —
+  headers/auth are never logged, session keys truncated to 120 chars).
+  The `/admin/api` poll itself is excluded from the `http` activity so the
+  2s refresh doesn't push real history out of the ring.
+- `GET /admin` (same `Bearer` auth) → self-contained HTML page that `fetch`-polls
+  `/admin/api` every 2s. The key comes from `prompt()` (stored in
+  `sessionStorage`); a 401 clears it and re-prompts. (`EventSource` can't set
+  `Authorization` headers, hence polling instead of SSE here.)
+
+```bash
+open http://127.0.0.1:8642/admin   # enter DSH_GATEWAY_KEY at the prompt
+curl -H "Authorization: Bearer <key>" http://127.0.0.1:8642/admin/api | jq .
 ```
 
 ## The key: where `DSH_GATEWAY_KEY` comes from
