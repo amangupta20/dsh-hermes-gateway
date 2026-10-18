@@ -20,14 +20,26 @@ kill it — only the headless CLI surface (`--json` event lines, `--session-id`)
 ```bash
 cd .  # repo root (gateway files live at the top level)
 npm install
-cp .env.example .env   # then edit .env and set a real DSH_GATEWAY_KEY (openssl rand -hex 32)
+cp gateway.env.example gateway.env   # then edit gateway.env and set a real DSH_GATEWAY_KEY (openssl rand -hex 32)
 node server.js         # listens on 0.0.0.0:8642 (Hermes default)
 ```
 
-Config precedence: **real environment > `.env` file > built-ins**. Values already
-set in the environment are never overwritten by `.env`. To use a different file,
-set `DSH_GATEWAY_ENV=/path/to/custom.env` (defaults to `./.env` next to
-`server.js`). `.env` is git-ignored; only `.env.example` is committed.
+Config precedence: **real environment > `gateway.env` file > built-ins**. Values already
+set in the environment are never overwritten by the file. To use a different file,
+set `DSH_GATEWAY_ENV=/path/to/custom.env` (defaults to `./gateway.env` next to
+`server.js`; `DSH_GATEWAY_ENV` itself is export-only). `gateway.env` is git-ignored;
+only `gateway.env.example` is committed.
+
+> **Why `gateway.env` and not `.env`?** dsh itself loads `./.env` from its working
+> directory (which is our `DSH_WORKSPACE` for every spawned run) and **refuses all
+> `DSH_*` names from any file** — bootstrap-only guard: only the inherited process
+> environment may supply them (they decide how dsh starts, where its code loads
+> from, how it reaches the network). A `DSH_*`-laden `.env` in the gateway directory
+> makes *every* `dsh` invocation from there — spawned runs and manual smoke tests
+> alike — die with ``sets "DSH_...", which only the launching environment may set``.
+> So the gateway config lives in `gateway.env`, which dsh never reads; values reach
+> spawned runs through the inherited environment (`export`, or the gateway's own
+> loader setting `process.env` before spawn).
 
 Alternative (no `.env` file — inline env one-liner):
 
@@ -65,7 +77,7 @@ systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
 | `DSH_PROFILE` | no | `headless` | `dsh` profile to drive. |
 | `DSH_MODEL` | no | `muse-spark-1.3-contributor` | Model string reported in `runtime.model`. |
 | `DSH_GATEWAY_DATA` | no | `./.dsh-hermes-gateway` | State dir: idempotency keys (24h TTL), session-key→dsh-session map, settled runs, dsh-confirmed session ids. |
-| `DSH_GATEWAY_ENV` | no | `./.env` (next to `server.js`) | Path to the `.env` file to load. Real env always wins over this file. |
+| `DSH_GATEWAY_ENV` | no | `./gateway.env` (next to `server.js`) | Path to the config file to load. Real env always wins over this file. Must be exported, not filed; must never resolve to a `.env` dsh reads (see above). |
 | `DSH_PREAMBLE` | no | (see below) | Context line prepended to every task so the harness agent knows it is serving a Paperclip Hermes run (includes run_id + session key). Set to empty to disable. |
 
 ## Contract notes

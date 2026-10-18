@@ -1,6 +1,10 @@
 node_modules/
 .dsh-hermes-gateway/
 tree.json
+gateway.env
+gateway.env.*
+!gateway.env.example
+# Never keep a real-key .env here either: dsh reads ./.env from its cwd and
+# refuses all DSH_* names from files, which would break every spawned run.
 .env
 .env.*
-!.env.example

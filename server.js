@@ -9,7 +9,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 // Minimal .env loader (no dependencies): real environment always wins.
-const __envFile = process.env.DSH_GATEWAY_ENV || path.join(__dirname, '.env');
+// NOTE: the default file is ./gateway.env, deliberately NOT ./.env — dsh itself
+// reads ./.env from its cwd (our WORKSPACE) and refuses ALL DSH_* names from any
+// file (bootstrap-only: only the inherited environment may supply them).
+const __envFile = process.env.DSH_GATEWAY_ENV || path.join(__dirname, 'gateway.env');
 try {
   const __src = fs.readFileSync(__envFile, 'utf8');
   for (const __line of __src.split('\n')) {
