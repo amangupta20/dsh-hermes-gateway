@@ -59,10 +59,19 @@ dsh --profile headless "say OK"   # answer goes to stdout; diagnostics to stderr
 ```
 
 `headless` rides on `dsh-base`, so it does NOT inherit your `web` profile's
-`cordis.patch.yml` model override. If the smoke test doesn't use your provider/model,
-copy the `llm-pi-ai` + `agent-default-model` entries from
-`$DSH_HOME/profiles/web/cordis.patch.yml` into the headless profile's patch file and
-re-run the smoke test until it answers with the right model.
+`cordis.patch.yml` model override. A stock headless profile fails with
+`MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"`.
+Fix: copy the `llm-pi-ai` + `agent-default-model` entries from
+`$DSH_HOME/profiles/web/cordis.patch.yml` into the headless profile's patch file
+(so headless uses the same provider and model your web UI already uses), then
+provide that provider's key — e.g. `export OPENCODE_GO_API_KEY='<key>'` using the
+same value the web Models page holds — in every shell that runs `dsh` or
+`node server.js` (persist via shell rc or systemd `EnvironmentFile`), and re-run
+the smoke test until it answers with the right model. (dsh also reads the
+credentials-service keyring, but an export is what headless and gateway-spawned
+runs see deterministically.) Keys must never go in a `.env` dsh reads (see above);
+`gateway.env` is fine for gateway-spawned runs since the gateway forwards its own
+environment to `dsh`, but an export additionally covers manual smoke tests.
 
 systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
 
