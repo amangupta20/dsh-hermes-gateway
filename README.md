@@ -11,7 +11,7 @@ kill it — only the headless CLI surface (`--json` event lines, `--session-id`)
 
 ## Layout
 
-- `server.js` — the whole gateway (~320 lines, `express` only)
+- `server.js` — the whole gateway (~350 lines, `express` only)
 - `package.json` — one dependency: `express`
 - `dev-shim.sh` — DEV-ONLY fake `dsh` for offline contract tests. Never use in prod.
 
@@ -64,7 +64,7 @@ systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
 | `DSH_BIN` | no | `dsh` | Path to the `dsh` binary (override for tests). |
 | `DSH_PROFILE` | no | `headless` | `dsh` profile to drive. |
 | `DSH_MODEL` | no | `muse-spark-1.3-contributor` | Model string reported in `runtime.model`. |
-| `DSH_GATEWAY_DATA` | no | `./.dsh-hermes-gateway` | State dir: idempotency keys (24h TTL), session-key→dsh-session map, settled runs. |
+| `DSH_GATEWAY_DATA` | no | `./.dsh-hermes-gateway` | State dir: idempotency keys (24h TTL), session-key→dsh-session map, settled runs, dsh-confirmed session ids. |
 | `DSH_GATEWAY_ENV` | no | `./.env` (next to `server.js`) | Path to the `.env` file to load. Real env always wins over this file. |
 | `DSH_PREAMBLE` | no | (see below) | Context line prepended to every task so the harness agent knows it is serving a Paperclip Hermes run (includes run_id + session key). Set to empty to disable. |
 
@@ -85,6 +85,16 @@ systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
   (durable across restarts): same issue resumes the same context, different issue is
   isolated. A key whose session is currently running starts an isolated run instead —
   **concurrent runs never share a live session**.
+- Session resume is **pass-confirmed-ids-only**: dsh's `--session-id` is resume-only —
+  an unknown id is a hard error (`session ... does not exist; omit --session-id to
+  start a new Session`), never auto-created. So the gateway passes `--session-id`
+  only for ids dsh itself reported via a prior `session` event (tracked in
+  `confirmed.json`, capped at 500). Fresh conversations omit the flag; dsh assigns
+  the id and the gateway maps it durably on the `session` event. If dsh ever reports
+  an unknown session (stale map entry, out-of-band prune), the gateway drops the
+  mapping and its confirmed status, so the next retry starts fresh instead of
+  looping on the phantom. First run after upgrading from a version without
+  `confirmed.json` starts one fresh session per conversation, then resumes normally.
 - SSE `GET /runs/:id/events`: `tool.started` / `tool.completed` (preview ≤500 chars,
   secret-redacted), `message.delta`, `reasoning.delta`, terminal `run.completed`
   (usage + runtime). `: keepalive` comment every 10s. Stored per run, so reconnects

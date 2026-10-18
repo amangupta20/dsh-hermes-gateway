@@ -40,10 +40,17 @@ const save = (f, o) => fs.writeFileSync(path.join(DATA_DIR, f), JSON.stringify(o
 let idem = load('idempotency.json', {});
 let sessMap = load('sessions.json', {});
 let settled = load('runs.json', {});
+let confirmed = load('confirmed.json', {}); // dsh-confirmed session ids -> first-seen ts (only ids dsh itself reported via a `session` event are ever passed as --session-id)
 for (const [k, v] of Object.entries(idem)) if (Date.now() - v.ts > IDEM_TTL) delete idem[k];
 const persistIdem = () => save('idempotency.json', idem);
 const persistSess = () => save('sessions.json', sessMap);
 const persistRuns = () => save('runs.json', settled);
+const persistConfirmed = () => { // cap 500 oldest; dsh's store is source of truth, this is a pass-list hint
+  const ks = Object.keys(confirmed);
+  if (ks.length > 500) for (const k of ks.slice(0, ks.length - 500)) delete confirmed[k];
+  save('confirmed.json', confirmed);
+};
+const noteConfirmed = (id) => { if (!id || confirmed[id]) return; confirmed[id] = Date.now(); persistConfirmed(); };
 
 // ---- in-memory runs ----
 const runs = new Map(); // run_id -> run
@@ -138,13 +145,20 @@ async function submit(req, res) {
   // task text: instructions + history + input
   let task = instructions ? `${instructions}\n\n${input}` : input;
   if (conversation_history?.length) task = conversation_history.map((m) => `${m.role || 'user'}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`).join('\n') + '\nuser: ' + input;
-  // resolve dsh session: explicit > previous_response > session-key map > fresh
+  // resolve dsh session: confirmed session-key map > previous_response > fresh (omit flag).
+  // dsh's --session-id is resume-only: an unknown id is a hard error ("does not exist;
+  // omit --session-id to start a new Session"), never auto-created. So only ids dsh itself
+  // confirmed via a prior `session` event are passed; fresh conversations omit the flag,
+  // dsh assigns the id, and onDsh stores the mapping durably on the `session` event.
   let dshSession;
   const prev = previous_response_id && (runs.get(previous_response_id) || settled[previous_response_id]);
-  if (session_id && sessMap['sid:' + session_id]) dshSession = sessMap['sid:' + session_id];
-  else if (session_id) dshSession = sessMap['sid:' + session_id] = `dsh-${crypto.randomBytes(8).toString('hex')}`;
-  else if (prev) dshSession = prev.session_id;
-  else if (skey && sessMap[skey]) dshSession = sessMap[skey];
+  const prevSid = prev && confirmed[prev.session_id] ? prev.session_id : undefined;
+  const mappedSid = session_id && sessMap['sid:' + session_id];
+  const mappedSkey = skey && sessMap[skey];
+  if (mappedSid && confirmed[mappedSid]) dshSession = mappedSid;
+  else if (prevSid) dshSession = prevSid;
+  else if (mappedSkey && confirmed[mappedSkey]) dshSession = mappedSkey;
+  // else fresh: omit --session-id entirely (see comment above)
   let resume = Boolean(dshSession);
   if (dshSession && runningSessions.has(dshSession)) { dshSession = undefined; resume = false; } // concurrent runs never share a live session
   const run = { run_id: newId('run'), status: 'running', session_id: dshSession || `pending-${crypto.randomBytes(4).toString('hex')}`,
@@ -152,7 +166,6 @@ async function submit(req, res) {
   runs.set(run.run_id, run);
   logAct('run_started', `${run.run_id} session=${truncKey(run.skey || session_id || dshSession || '', 120)} resume=${resume}`);
   idem[key] = { run_id: run.run_id, bodyHash, ts: Date.now() }; persistIdem();
-  if (session_id) persistSess();
   const note = process.env.DSH_PREAMBLE === undefined
     ? 'You are executing a task issued by Paperclip through dsh-hermes-gateway. Do the work and put the final result in your reply.'
     : process.env.DSH_PREAMBLE;
@@ -188,6 +201,7 @@ function onDsh(run, e) {
   if (run.status !== 'running') return;
   switch (e.type) {
     case 'session': run.session_id = e.sessionId || run.session_id;
+      if (e.sessionId) noteConfirmed(e.sessionId); // the ONLY source of passable --session-id values
       if (run.skey && !sessMap[run.skey]) { sessMap[run.skey] = run.session_id; persistSess(); }
       if (run.sid && !sessMap['sid:' + run.sid]) { sessMap['sid:' + run.sid] = run.session_id; persistSess(); }
       runningSessions.add(run.session_id); break;
@@ -197,7 +211,18 @@ function onDsh(run, e) {
     case 'thinking': push(run, 'reasoning.delta', { run_id: run.run_id, delta: e.text || '' }); break;
     case 'status': if (e.usage) { const u = e.usage; run.usage = { input_tokens: u.inputTokens || 0, output_tokens: u.outputTokens || 0, total_tokens: u.totalTokens ?? (u.inputTokens || 0) + (u.outputTokens || 0) }; } break;
     case 'final': settle(run, 'completed', e.text || run.output); break;
-    case 'error': settle(run, 'failed', e.message || 'dsh error'); break;
+    case 'error': {
+      const m = /session "([^"]+)" does not exist/.exec(e.message || '');
+      if (m) { // stale mapping (e.g. session never created, or pruned out-of-band): drop it + unconfirm so the next retry starts fresh instead of looping on the phantom
+        let n = 0;
+        for (const [k, v] of Object.entries(sessMap)) if (v === m[1]) { delete sessMap[k]; n++; }
+        if (n) persistSess();
+        if (confirmed[m[1]]) { delete confirmed[m[1]]; persistConfirmed(); }
+        logAct('error', `${run.run_id} dsh reports unknown session ${truncKey(m[1])}; dropped ${n} mapping${n === 1 ? '' : 's'} — retry starts fresh`);
+      }
+      settle(run, 'failed', e.message || 'dsh error');
+      break;
+    }
   }
 }
 function settle(run, status, output) {
