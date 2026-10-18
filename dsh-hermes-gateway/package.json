@@ -1,0 +1,1 @@
+{"name":"dsh-hermes-gateway","version":"0.1.0","private":true,"description":"Hermes-compatible HTTP gateway driving DeepSeek Harness via dsh headless","type":"commonjs","main":"server.js","license":"MIT","dependencies":{"express":"^4.19.2"},"engines":{"node":">=22"}}

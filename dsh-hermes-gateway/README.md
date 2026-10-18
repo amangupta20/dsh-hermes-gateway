@@ -1,0 +1,137 @@
+# dsh-hermes-gateway
+
+Hermes-compatible HTTP sidecar so **Paperclip** can drive **DeepSeek Harness (`dsh`)**
+exactly like a built-in `hermes_gateway` agent — on a separate machine, with **no new
+Paperclip adapter**. Point Paperclip's `hermes_gateway` type at this server.
+
+How it works: the gateway exposes the Hermes API-server contract (runs + SSE) and
+executes each task as `dsh --profile <DSH_PROFILE> --json [--session-id <id>] "<task>"`
+in a subprocess. No Cordis internals are imported, so `dsh` rc breaking changes don't
+kill it — only the headless CLI surface (`--json` event lines, `--session-id`) matters.
+
+## Layout
+
+- `server.js` — the whole gateway (~220 lines, `express` only)
+- `package.json` — one dependency: `express`
+- `dev-shim.sh` — DEV-ONLY fake `dsh` for offline contract tests. Never use in prod.
+
+## Run
+
+```bash
+cd dsh-hermes-gateway
+npm install
+DSH_GATEWAY_KEY='<long-random-secret>' \   # required, == Paperclip's apiKey
+DSH_WORKSPACE=/path/to/working/dir \        # cwd for all runs (resume requires one stable cwd)
+DSH_PROFILE=headless \                       # dsh profile to drive
+DSH_MODEL='muse-spark-1.3-contributor' \     # advertised in runtime.model
+PORT=8642 node server.js                     # listens on 0.0.0.0:8642 (Hermes default)
+```
+
+Target machine needs the shipped `headless` profile working (no setup needed for the
+template itself — just smoke-test it):
+
+```bash
+dsh --profile headless "say OK"   # answer goes to stdout; diagnostics to stderr
+```
+
+`headless` rides on `dsh-base`, so it does NOT inherit your `web` profile's
+`cordis.patch.yml` model override. If the smoke test doesn't use your provider/model,
+copy the `llm-pi-ai` + `agent-default-model` entries from
+`$DSH_HOME/profiles/web/cordis.patch.yml` into the headless profile's patch file and
+re-run the smoke test until it answers with the right model.
+
+systemd hint: `Restart=always`, `EnvironmentFile=/etc/dsh-hermes-gateway.env`.
+
+## Env
+
+| Var | Required | Default | Meaning |
+|---|---|---|---|
+| `DSH_GATEWAY_KEY` | **yes** | — | Bearer key; must equal Paperclip's `apiKey`. Never logged. |
+| `PORT` | no | `8642` | Listen port on `0.0.0.0`. |
+| `DSH_WORKSPACE` | no | server cwd | cwd for every `dsh` run. Keep stable — headless `--session-id` resume requires the same cwd. |
+| `DSH_BIN` | no | `dsh` | Path to the `dsh` binary (override for tests). |
+| `DSH_PROFILE` | no | `headless` | `dsh` profile to drive. |
+| `DSH_MODEL` | no | `muse-spark-1.3-contributor` | Model string reported in `runtime.model`. |
+| `DSH_GATEWAY_DATA` | no | `./.dsh-hermes-gateway` | State dir: idempotency keys (24h TTL), session-key→dsh-session map, settled runs. |
+| `DSH_PREAMBLE` | no | (see below) | Context line prepended to every task so the harness agent knows it is serving a Paperclip Hermes run (includes run_id + session key). Set to empty to disable. |
+
+## Contract notes
+
+- Health (`GET /health`, `/api/health`, `/v1/health`) needs no auth. Everything else
+  needs `Authorization: Bearer <DSH_GATEWAY_KEY>` (else 401).
+- Every route is served under **both** `/v1/...` and `/api/v1/...` (Paperclip maps
+  dashboard roots to `/api`, so single-prefix would 404 its probes). `GET /v1/runs`
+  (and `/api/...`) returns **405** — POST-only proof.
+- `POST /runs` body: `{input*, session_id?, instructions?, conversation_history?, previous_response_id?, model?, provider?}`.
+  Bad bodies → `400 {"error":{"code":"invalid_params",...}}`.
+- `Idempotency-Key` (1–255 visible ASCII) is stored durably 24h → run_id. Identical
+  retry → `202` + `Idempotency-Replayed: true` + same run_id. Same key + different
+  body → `409 {"error":{"code":"idempotency_key_conflict",...}}`.
+- `X-Hermes-Session-Key` (≤256 chars, no CR/LF/NUL) maps e.g.
+  `paperclip:company:<cid>:agent:<aid>:issue:<iid>` to one persistent dsh session id
+  (durable across restarts): same issue resumes the same context, different issue is
+  isolated. A key whose session is currently running starts an isolated run instead —
+  **concurrent runs never share a live session**.
+- SSE `GET /runs/:id/events`: `tool.started` / `tool.completed` (preview ≤500 chars,
+  secret-redacted), `message.delta`, `reasoning.delta`, terminal `run.completed`
+  (usage + runtime). `: keepalive` comment every 10s. Stored per run, so reconnects
+  replay from the start; settled runs replay then close.
+- `POST /runs/:id/stop` kills the whole `dsh` process group (SIGTERM → SIGKILL) and
+  returns `{"status":"stopping"}`; the run settles to `cancelled`.
+- SIGTERM/SIGINT: new submissions get `503` + `Retry-After: 5`, running procs are
+  signalled, server exits when quiet (≤30s).
+
+## Curl tests (all verified against `dev-shim.sh`)
+
+```bash
+BASE=http://127.0.0.1:8642; AUTH="Authorization: Bearer <key>"
+# 1. health (no auth)
+curl $BASE/health; curl $BASE/api/health            # -> {"status":"ok"}
+# 2. models: 200 with key, 401 without
+curl -H "$AUTH" $BASE/v1/models                     # -> [{"id":"dsh-agent","object":"model"}]
+curl $BASE/v1/models                                # -> 401
+# 3. POST-only proof
+curl $BASE/v1/runs                                  # -> 405
+# 4. submit -> poll -> replay -> conflict
+curl -X POST -H "$AUTH" -H "Idempotency-Key: test-1" \
+  -H "X-Hermes-Session-Key: paperclip:company:c1:agent:a1:issue:i1" \
+  -d '{"input":"echo OK and list cwd"}' $BASE/v1/runs   # -> {"run_id":"run_...","status":"started"}
+curl -H "$AUTH" $BASE/v1/runs/<run_id>                 # -> status completed + output + runtime
+curl -X POST -H "$AUTH" -H "Idempotency-Key: test-1" \  # same body -> 202 + Idempotency-Replayed: true
+  -d '{"input":"echo OK and list cwd"}' $BASE/v1/runs
+curl -X POST -H "$AUTH" -H "Idempotency-Key: test-1" \  # diff body -> 409 idempotency_key_conflict
+  -d '{"input":"other"}' $BASE/v1/runs
+# 5. SSE (+ keepalive every 10s)
+curl -N -H "$AUTH" $BASE/v1/runs/<run_id>/events
+# 6. stop: submit {"input":"... sleep 60 ..."}, then:
+curl -X POST -H "$AUTH" $BASE/v1/runs/<run_id>/stop   # -> {"status":"stopping"}
+curl -H "$AUTH" $BASE/v1/runs/<run_id>                # -> status cancelled
+```
+
+## The key: where `DSH_GATEWAY_KEY` comes from
+
+**You generate it** — Paperclip never issues this secret. Verified against the
+Paperclip repo (`paperclipai/paperclip`, `doc/HERMES_GATEWAY_ONBOARDING.md` and
+`ui/src/lib/agent-onboarding-prompt.ts`): "generate a fresh random gateway key,
+start Hermes with `API_SERVER_KEY=<random-gateway-key>`", and "Paperclip stores the
+same value as `agentDefaultsPayload.apiKey`". The hire prompt pasted into the
+external agent contains no secret — only onboarding URLs and the join flow.
+
+1. Generate: `openssl rand -hex 32` (or any ≥32 random bytes).
+2. Start the gateway with that exact value as `DSH_GATEWAY_KEY` (see Run above).
+3. Submit the hire request to Paperclip (`POST /api/invites/:token/accept`, the
+   "request to be hired") with the JSON below, putting the **same** value in
+   `agentDefaultsPayload.apiKey`. From then on Paperclip calls the gateway with
+   `Authorization: Bearer <that key>`.
+4. Separate flow, separate secret: after board approval, claim a one-time
+   Paperclip agent key (`POST /api/join-requests/:rid/claim-api-key`) for the
+   gateway→Paperclip direction. Never reuse the gateway key as the Paperclip key.
+
+Rotate by generating a fresh key, updating both the gateway env and Paperclip's
+stored `apiKey`, and restarting the gateway.
+
+## Paperclip hire JSON (you submit this — the gateway never calls it)
+
+```json
+{"requestType":"agent","agentName":"<my-name>","adapterType":"hermes_gateway","capabilities":"dsh harness agent","agentDefaultsPayload":{"apiBaseUrl":"http://<this-host>:8642","apiKey": "<DSH_GATEWAY_KEY>","paperclipApiUrl":"http://<paperclip>:3100","sessionKeyStrategy":"issue"}}
+```
